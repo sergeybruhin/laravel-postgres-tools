@@ -1,0 +1,374 @@
+<?php
+
+namespace SergeyBruhin\PostgresTools\Console;
+
+use Illuminate\Console\Command;
+use SergeyBruhin\PostgresTools\Data\BackupFile;
+use SergeyBruhin\PostgresTools\Data\DumpOptions;
+use SergeyBruhin\PostgresTools\Data\Finding;
+use SergeyBruhin\PostgresTools\Data\Manifest;
+use SergeyBruhin\PostgresTools\Data\Target;
+use SergeyBruhin\PostgresTools\Exceptions\PostgresToolsException;
+use SergeyBruhin\PostgresTools\Services\BackupRepository;
+use SergeyBruhin\PostgresTools\Services\ConsistencyChecker;
+use SergeyBruhin\PostgresTools\Services\EnvironmentReport;
+use SergeyBruhin\PostgresTools\Services\ManifestWriter;
+use SergeyBruhin\PostgresTools\Services\RestoreService;
+use SergeyBruhin\PostgresTools\Services\TargetResolver;
+
+class RestoreCommand extends Command
+{
+    protected $signature = 'pg:restore
+        {file?         : Dump to restore (omit to use the newest in the backup directory)}
+        {--connection= : Laravel connection to restore into}
+        {--database=   : Override the database name within that connection}
+        {--path=       : Backup directory to look in (default: config postgres-tools.path)}
+        {--drop        : DROP and CREATE the target database before restoring}
+        {--clean       : pg_restore --clean --if-exists instead of dropping the database}
+        {--jobs=1      : Parallel restore workers (custom format only)}
+        {--skip-verify : Skip the checksum and archive checks}
+        {--skip-checks : Skip post-restore row-count and migration reconciliation}
+        {--dry-run     : Show what would happen and exit}
+        {--force       : Skip interactive confirmation}';
+
+    protected $description = 'Restore a Postgres dump, verifying it first and reconciling row counts afterwards';
+
+    public function handle(
+        TargetResolver     $resolver,
+        EnvironmentReport  $report,
+        BackupRepository   $backups,
+        RestoreService     $restores,
+        ManifestWriter     $manifests,
+        ConsistencyChecker $checker,
+    ): int {
+        if (($guard = $this->guardEnvironment()) !== null) {
+            return $guard;
+        }
+
+        try {
+            $target = $resolver->resolve($this->option('connection'), $this->option('database'));
+            $path   = $backups->path($this->option('path'));
+            $file   = $this->resolveFile($backups, $path);
+        } catch (PostgresToolsException $e) {
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        $manifest = $manifests->read($file);
+
+        // A target database that does not exist yet is fine here — --drop is about to
+        // create it — so the existence check is relaxed for the restoring side.
+        $findings = $report->findings($target, $path, requireDatabase: false);
+
+        $exists = $checker->databaseExists($target);
+        $server = $report->server($target);
+
+        if ($manifest !== null) {
+            $findings[] = $checker->versionFinding($manifest, $server['major']);
+        }
+
+        if ($exists && !$this->option('drop') && !$this->option('clean') && $checker->tableCount($target) > 0) {
+            $findings[] = Finding::warn(
+                "{$target->database} already contains tables; restoring on top of them will collide.",
+                'Pass --drop to recreate the database, or --clean to drop objects as they are replaced.'
+            );
+        }
+
+        $this->summary($target, $file, $manifest, $server, $exists);
+
+        if ($this->printFindings($findings) === self::FAILURE) {
+            return self::FAILURE;
+        }
+
+        if (!$this->option('skip-verify') && ($verify = $this->verify($checker, $file, $manifest)) !== self::SUCCESS) {
+            return $verify;
+        }
+
+        if ($this->option('dry-run')) {
+            $this->dryRun($restores, $target, $file, $manifest);
+
+            return self::SUCCESS;
+        }
+
+        if (!$this->confirmDestruction($target)) {
+            $this->line('Aborted.');
+
+            return self::SUCCESS;
+        }
+
+        try {
+            if ($this->option('drop')) {
+                $this->line("Recreating database {$target->database}…");
+                $restores->recreateDatabase($target);
+            } elseif ($restores->createDatabaseIfMissing($target)) {
+                $this->line("Created database {$target->database}.");
+            }
+
+            $plain   = $this->formatOf($file, $manifest) === DumpOptions::FORMAT_PLAIN;
+            $started = microtime(true);
+            $echo    = function (string $line): void {
+                $this->line('  ' . $line);
+            };
+
+            if ($plain) {
+                $this->line('Running psql…');
+                $warnings = $restores->restorePlain($target, $file, $echo);
+            } else {
+                $this->line('Running pg_restore…');
+                $warnings = $restores->restore(
+                    target: $target,
+                    file: $file,
+                    jobs: max(1, (int) $this->option('jobs')),
+                    clean: (bool) $this->option('clean'),
+                    onOutput: $echo,
+                );
+            }
+
+            $elapsed = round(microtime(true) - $started, 1);
+            $this->info("Restored in {$elapsed}s." . ($warnings === [] ? '' : ' ' . count($warnings) . ' warning(s).'));
+        } catch (PostgresToolsException $e) {
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        if (!$this->option('skip-checks')) {
+            $this->reconcile($checker, $target, $manifest);
+        }
+
+        return self::SUCCESS;
+    }
+
+    /**
+     * Restoring over a production database is almost never what anyone means to do, so it
+     * takes both --force and an explicit config opt-in rather than a prompt someone can
+     * click through at 2am.
+     */
+    private function guardEnvironment(): ?int
+    {
+        if (!$this->getLaravel()->environment('production')) {
+            return null;
+        }
+
+        $allowed = (bool) config('postgres-tools.allow_production_restore', false);
+
+        if ($allowed && $this->option('force')) {
+            $this->warn('APP_ENV=production — proceeding because --force and allow_production_restore are both set.');
+
+            return null;
+        }
+
+        $this->error('Refusing to restore while APP_ENV=production.');
+        $this->line('This would overwrite live data. If that is genuinely the intent, set');
+        $this->line('PG_TOOLS_ALLOW_PRODUCTION_RESTORE=true and pass --force.');
+
+        return self::FAILURE;
+    }
+
+    /**
+     * @throws PostgresToolsException
+     */
+    private function resolveFile(BackupRepository $backups, string $path): string
+    {
+        $argument = $this->argument('file');
+
+        if ($argument !== null) {
+            return $backups->resolveFile((string) $argument, $path);
+        }
+
+        $latest = $backups->latest($path);
+
+        if ($latest === null) {
+            throw new PostgresToolsException(
+                "No dumps found in {$path}. Pass a file explicitly, or run pg:backup first."
+            );
+        }
+
+        return $latest->path;
+    }
+
+    /** @param array<string, mixed> $server */
+    private function summary(Target $target, string $file, ?Manifest $manifest, array $server, bool $exists): void
+    {
+        $bytes = is_file($file) ? (int) filesize($file) : 0;
+
+        $rows = [
+            ['Target', $target->describe() . ($exists ? '' : '  (will be created)')],
+            ['Connection', $target->connection],
+            ['Server', $server['version'] ?? '—'],
+            ['Dump', $file],
+            ['Dump size', BackupFile::formatBytes($bytes)],
+        ];
+
+        if ($manifest !== null) {
+            $rows[] = ['Taken from', $manifest->database . ' @ ' . $manifest->host];
+            $rows[] = ['Taken at', $manifest->createdAt . ' (' . $manifest->appEnv . ')'];
+            $rows[] = ['Dump server', $manifest->serverVersion];
+            $rows[] = ['Tables', (string) count($manifest->rowCounts)];
+            $rows[] = ['Emptied tables', $manifest->excludedTableData === [] ? '—' : implode(', ', $manifest->excludedTableData)];
+            $rows[] = ['App version', $manifest->appVersion ?? '—'];
+        } else {
+            $rows[] = ['Manifest', 'none — this dump cannot be checksum-verified'];
+        }
+
+        $rows[] = ['Mode', match (true) {
+            (bool) $this->option('drop')  => 'DROP and CREATE the database',
+            (bool) $this->option('clean') => 'drop each object as it is replaced',
+            default                       => 'load into the database as it stands',
+        }];
+
+        $this->newLine();
+        $this->table(['Restore', ''], $rows);
+    }
+
+    private function verify(ConsistencyChecker $checker, string $file, ?Manifest $manifest): int
+    {
+        try {
+            if ($manifest === null) {
+                $this->warn('No manifest alongside this dump — skipping the checksum check.');
+            } else {
+                $checker->verifyChecksum($file, $manifest);
+                $this->info('Checksum matches the manifest.');
+            }
+
+            if ($this->formatOf($file, $manifest) === DumpOptions::FORMAT_CUSTOM) {
+                $entries = $checker->verifyArchive($file);
+                $this->info("Archive readable: {$entries} entries.");
+            } else {
+                $this->line('Plain-format dump — there is no archive index to read back.');
+            }
+        } catch (PostgresToolsException $e) {
+            $this->error($e->getMessage());
+
+            return self::FAILURE;
+        }
+
+        return self::SUCCESS;
+    }
+
+    /** Trusts the manifest when there is one, otherwise sniffs the archive's magic bytes. */
+    private function formatOf(string $file, ?Manifest $manifest): string
+    {
+        return (new BackupFile($file, 0, 0, $manifest))->format();
+    }
+
+    private function dryRun(RestoreService $restores, Target $target, string $file, ?Manifest $manifest): void
+    {
+        if ($this->formatOf($file, $manifest) === DumpOptions::FORMAT_PLAIN) {
+            $this->line('<comment>Would pipe this plain-SQL dump through psql</comment>; --jobs and --clean do not apply.');
+            $this->info('Dry run — nothing was changed.');
+
+            return;
+        }
+
+        try {
+            $argv = $restores->command($target, $file, max(1, (int) $this->option('jobs')), (bool) $this->option('clean'));
+        } catch (PostgresToolsException $e) {
+            $this->warn('Cannot build the pg_restore invocation:');
+            $this->line('  ' . str_replace(PHP_EOL, PHP_EOL . '  ', $e->getMessage()));
+
+            return;
+        }
+
+        if ($this->option('drop')) {
+            $this->line('<comment>Would drop and recreate</comment> ' . $target->database . ' over PDO, then run:');
+        } else {
+            $this->line('<comment>Would run</comment> (credentials travel via PGPASSFILE, not argv):');
+        }
+
+        $this->line('  ' . implode(" \\\n    ", $argv));
+        $this->newLine();
+        $this->info('Dry run — nothing was changed.');
+    }
+
+    /**
+     * A plain yes/no is enough for a scratch database. When the target is the database this
+     * app is actually configured to use, make the name be typed out — that is the case
+     * where a wrong --database costs real work.
+     */
+    private function confirmDestruction(Target $target): bool
+    {
+        if ($this->option('force')) {
+            return true;
+        }
+
+        $live = config('database.connections.' . config('database.default') . '.database');
+
+        if ($target->database === $live) {
+            $this->newLine();
+            $this->warn("{$target->database} is the database this app is configured to use.");
+            $this->line('This will overwrite it.');
+
+            return $this->ask('Type the database name to confirm') === $target->database;
+        }
+
+        return $this->confirm("Restore into {$target->describe()}?", false);
+    }
+
+    private function reconcile(ConsistencyChecker $checker, Target $target, ?Manifest $manifest): void
+    {
+        $this->newLine();
+
+        if ($manifest === null) {
+            $this->line('No manifest — skipping row-count reconciliation.');
+        } else {
+            $this->line('Reconciling row counts…');
+            $diff = $checker->reconcile($manifest, $checker->rowCounts($target));
+
+            if ($diff === []) {
+                $this->info('All ' . count($manifest->rowCounts) . ' tables match the manifest.');
+            } else {
+                $this->warn(count($diff) . ' table(s) differ from the manifest:');
+                $this->table(['Table', 'In dump', 'Restored'], $diff);
+            }
+        }
+
+        $pending = $checker->pendingMigrations($target);
+
+        if ($pending === []) {
+            $this->info('Schema is up to date with database/migrations.');
+
+            return;
+        }
+
+        $this->warn(count($pending) . ' pending migration(s) — run `php artisan migrate`:');
+
+        foreach (array_slice($pending, 0, 10) as $migration) {
+            $this->line('  ' . $migration);
+        }
+
+        if (count($pending) > 10) {
+            $this->line('  … and ' . (count($pending) - 10) . ' more');
+        }
+    }
+
+    /** @param array<Finding> $findings */
+    private function printFindings(array $findings): int
+    {
+        foreach ($findings as $finding) {
+            if ($finding->isFail()) {
+                $this->error('[fail] ' . $finding->message);
+
+                if ($finding->hint !== null) {
+                    $this->line('       ' . $finding->hint);
+                }
+            } elseif ($finding->isWarn()) {
+                $this->warn('[warn] ' . $finding->message);
+
+                if ($finding->hint !== null) {
+                    $this->line('       ' . $finding->hint);
+                }
+            }
+        }
+
+        if (EnvironmentReport::hasFailure($findings)) {
+            $this->newLine();
+            $this->error('Refusing to continue. Run `php artisan pg:info` for the full report.');
+
+            return self::FAILURE;
+        }
+
+        return self::SUCCESS;
+    }
+}

@@ -1,0 +1,71 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php: '8.1'
+            laravel: '^10.0'
+            testbench: '^8.0'
+          - php: '8.2'
+            laravel: '^11.0'
+            testbench: '^9.0'
+          - php: '8.3'
+            laravel: '^12.0'
+            testbench: '^10.0'
+          - php: '8.4'
+            laravel: '^12.0'
+            testbench: '^10.0'
+
+    name: PHP ${{ matrix.php }} / Laravel ${{ matrix.laravel }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: pdo, pdo_pgsql
+          coverage: none
+
+      # Composer refuses packages with published advisories by default. Every Laravel 10
+      # release carries one, so the 10.x leg cannot install without relaxing this. It is
+      # set on the ephemeral runner only, never in composer.json, so nobody installing the
+      # package inherits a weakened policy.
+      - name: Allow advisory-flagged dependencies
+        if: matrix.laravel == '^10.0'
+        run: composer config policy.advisories.block false
+
+      - name: Install dependencies
+        run: |
+          composer require --dev --no-update \
+            "laravel/framework:${{ matrix.laravel }}" \
+            "orchestra/testbench:${{ matrix.testbench }}"
+          composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Run tests
+        run: vendor/bin/phpunit --display-all-issues
+
+  validate:
+    runs-on: ubuntu-latest
+    name: composer validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - run: composer validate --strict
