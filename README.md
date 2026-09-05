@@ -1,7 +1,7 @@
 # Laravel PostgreSQL Tools
 
 [![tests](https://github.com/sergeybruhin/laravel-postgres-tools/actions/workflows/tests.yml/badge.svg)](https://github.com/sergeybruhin/laravel-postgres-tools/actions/workflows/tests.yml)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 
 PostgreSQL backup and restore as Artisan commands, with the checks that turn *"the command
 exited 0"* into *"this dump is actually restorable"*.
@@ -524,4 +524,4 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+The MIT License (MIT). Please see [License File](LICENSE.md) for more information.
