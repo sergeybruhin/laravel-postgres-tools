@@ -16,8 +16,9 @@ This package checks for each of those, before and after the operation.
 pg:info      report server version, client binaries, their compatibility, and disk headroom
 pg:backup    dump a database, verify the archive, write a manifest beside it
 pg:restore   verify a dump, recreate the database, load it, reconcile row counts
-pg:backups   list the dumps on disk
+pg:backups   list the dumps on disk, or the ones held offsite
 pg:verify    check one dump against its manifest without restoring anything
+pg:check     fail when there is no recent, verifiable backup
 ```
 
 ---
@@ -108,6 +109,10 @@ php artisan pg:info --strict || exit 1
 {--only-table=*         : Restrict the dump to these table patterns (repeatable)}
 {--all                  : Ignore the configured exclusions and dump everything}
 {--keep=                : Keep only the N newest dumps (bare --keep uses the config value)}
+{--upload               : Copy the finished dump and its manifest to the configured disk}
+{--disk=                : Disk to upload to (default: config postgres-tools.disk)}
+{--disk-path=           : Directory within that disk}
+{--keep-remote=         : Keep only the N newest dumps on the disk}
 {--no-manifest          : Skip the sidecar .json manifest}
 {--dry-run              : Print the resolved pg_dump invocation and exit}
 {--force                : Skip interactive confirmation}
@@ -125,6 +130,10 @@ php artisan pg:backup --dry-run          # shows the exact argv, no credentials 
 {--connection= : Laravel connection to restore into}
 {--database=   : Override the database name within that connection}
 {--path=       : Backup directory to look in}
+{--from-disk   : Fetch the dump from the offsite disk first}
+{--disk=       : Disk to fetch from (implies --from-disk)}
+{--disk-path=  : Directory within that disk}
+{--keep-download : Keep the fetched copy in the backup directory afterwards}
 {--drop        : DROP and CREATE the target database before restoring}
 {--clean       : pg_restore --clean --if-exists instead of dropping the database}
 {--jobs=1      : Parallel restore workers (custom format only)}
@@ -138,14 +147,34 @@ php artisan pg:backup --dry-run          # shows the exact argv, no credentials 
 php artisan pg:restore --database=app_scratch --drop --force
 ```
 
-### `pg:backups`, `pg:verify`
+### `pg:backups`, `pg:verify`, `pg:check`
 
 ```bash
 php artisan pg:backups              # table of dumps: size, created, format, database, server
 php artisan pg:backups --checksum   # also hash every file (reads each one in full)
+php artisan pg:backups --remote     # the same table, for the offsite disk
 php artisan pg:verify               # newest dump: checksum + archive readability
 php artisan pg:verify some.dump
+php artisan pg:verify --remote      # checksum the offsite copy without downloading it
+php artisan pg:check                # exit non-zero unless a recent, verifiable dump exists
 ```
+
+`pg:check` is the one to wire into monitoring. `pg:backup` reports its own failures, but the
+failure that actually loses data is quieter than that — a scheduler that stopped running, an
+image rebuilt without the client binaries, a disk whose credentials expired. None of those
+produce a failed backup; they produce **no** backup, and nothing to notice. `pg:check` asks the
+only question that matters, of the files rather than the process:
+
+```bash
+php artisan pg:check                        # newest dump present, has a manifest, within max_age_hours
+php artisan pg:check --checksum             # also verify it byte for byte
+php artisan pg:check --remote               # ask the same of the offsite copy
+php artisan pg:check --quiet-ok             # silent on success, for cron and container healthchecks
+php artisan pg:check --max-age=6
+```
+
+It touches no database, which is what lets it answer when the database is the thing that is
+broken. On failure it prints the reason, exits non-zero, and fires `BackupStale`.
 
 ## Pointing at another database
 
@@ -195,6 +224,96 @@ checksum is its only integrity signal, and restoring needs `psql` rather than `p
 
 `pg:restore` picks the right path automatically, from the manifest when there is one and from
 the archive's magic bytes when there is not.
+
+## Offsite copies
+
+A dump that only exists on the machine that produced it is not a backup of that machine. Name
+any disk from `config/filesystems.php` and dumps go there too — s3, sftp, ftp, or simply a
+second local disk on a different volume. Nothing about the package is tied to a provider.
+
+```bash
+PG_TOOLS_DISK=s3
+PG_TOOLS_DISK_PATH=backups
+PG_TOOLS_KEEP_REMOTE=30
+```
+
+```bash
+php artisan pg:backup --force --keep=7 --upload --keep-remote
+php artisan pg:backups --remote
+php artisan pg:verify  --remote
+php artisan pg:restore --from-disk --database=app_scratch --drop
+```
+
+Set `PG_TOOLS_UPLOAD_AFTER_BACKUP=true` to make it standing policy instead of a flag per run.
+
+Everything **streams**. A dump is routinely larger than `memory_limit`, so nothing is ever read
+into a string — uploads and downloads move through `writeStream`/`readStream`, and
+`pg:verify --remote` hashes the object where it sits rather than pulling it down.
+
+Local and offsite retention are separate settings (`keep` and `keep_remote`) because they answer
+different questions: how much the local volume can hold, versus how far back you want to be able
+to go.
+
+**How a complete upload is recognised.** Locally, a dump is written to `<name>.part` and renamed
+only on success, so a half-written file never wears a finished name. Object stores have no cheap
+atomic rename to mirror that, so the manifest does the job instead: the dump is uploaded first
+and the manifest second. The manifest is the only thing that can verify a dump, so a listing
+that finds a dump without one already reports it as unverifiable rather than as good. Uploads
+are also size-checked against the source, and a short one is deleted rather than left to look
+like a backup.
+
+**Restoring from a disk** downloads into a dotted staging directory inside the backup directory,
+never on top of the backup directory itself — a dump fetched from the disk usually has the same
+filename as the local copy it was made from. From there it takes the ordinary path: checksum,
+archive parse, restore, reconcile. The staged copy is removed afterwards unless you pass
+`--keep-download`; a *failed* restore leaves it in place on purpose, so a retry does not pay to
+pull a multi-gigabyte dump down twice, and the next fetch clears the staging area.
+
+If the disk is unreachable the upload fails but the backup does not: the local dump is real and
+verified, and throwing it away because a bucket was down would destroy the thing that just
+succeeded. You get a `BackupUploadFailed` event and a non-fatal error on stderr.
+
+## Events
+
+The package emits events and takes no view on what should happen next. Route them to Slack,
+Telegram, email, PagerDuty, a database row — whatever you already use — from a listener in your
+own application:
+
+| Event | Meaning |
+|---|---|
+| `BackupStarted` | a dump is about to be written |
+| `BackupCompleted` | dump written, read back by `pg_restore`, manifest recorded |
+| `BackupFailed` | the run produced no verified dump |
+| `BackupUploaded` | dump and manifest reached the disk intact |
+| `BackupUploadFailed` | the local dump is fine, its offsite copy is not |
+| `BackupPruned` | retention removed older dumps |
+| `BackupStale` | `pg:check` found nothing recent enough to be worth having |
+| `RestoreStarted` / `RestoreCompleted` / `RestoreFailed` | the same three for a restore |
+
+```php
+// app/Providers/AppServiceProvider.php
+Event::listen(BackupFailed::class, static function (BackupFailed $event): void {
+    Log::critical('Backup failed', [
+        'database' => $event->target->database,
+        'error'    => $event->exception->getMessage(),
+    ]);
+});
+```
+
+`BackupCompleted` carries the `Manifest`, so a listener can report the size, the table count and
+the app version that produced the dump. `RestoreCompleted` carries the reconciliation result and
+has an `isClean()` helper — a restore that lands with rows missing or the schema behind the code
+still exits zero, and that is exactly the case worth alerting on.
+
+Two details worth knowing:
+
+- **`BackupFailed` fires even when the run is refused before it starts.** A scheduled backup
+  whose `pg_dump` vanished emits nothing else, and silence is indistinguishable from a scheduler
+  that stopped running. So a `BackupFailed` may arrive without a preceding `BackupStarted`; a
+  `BackupStarted` with no terminal event means the process was killed outright.
+- **Queue your listeners.** They run inline, inside the backup, so a slow webhook stalls the dump
+  and a throwing one fails it. `ShouldQueue` keeps a notification channel from becoming a
+  dependency of your backups.
 
 ## The manifest
 
@@ -269,7 +388,9 @@ All 47 tables match the manifest.
 - **Partial dumps never masquerade as backups.** Output is written to `<name>.part` and renamed
   only on success.
 - **Dumps contain everything.** Customer data, password hashes, API tokens. Store them
-  accordingly, and add the backup directory to `.gitignore`.
+  accordingly, and add the backup directory to `.gitignore`. That applies doubly to an offsite
+  disk: the bucket needs to be private, and the dumps are not encrypted by this package — if
+  they leave your infrastructure, encrypt them or use a disk that does it for you.
 
 ## Configuration
 
@@ -282,6 +403,18 @@ All 47 tables match the manifest.
 | `exclude_tables` | `PG_TOOLS_EXCLUDE_TABLES` | *(empty)* |
 | `exclude_table_data` | `PG_TOOLS_EXCLUDE_TABLE_DATA` | telescope, jobs, sessions, cache tables |
 | `keep` | `PG_TOOLS_KEEP` | `7` |
+| `disk` | `PG_TOOLS_DISK` | *(none — local only)* |
+| `disk_path` | `PG_TOOLS_DISK_PATH` | `backups` |
+| `upload_after_backup` | `PG_TOOLS_UPLOAD_AFTER_BACKUP` | `false` |
+| `keep_remote` | `PG_TOOLS_KEEP_REMOTE` | `30` |
+| `max_age_hours` | `PG_TOOLS_MAX_AGE_HOURS` | `26` |
+| `schedule.enabled` | `PG_TOOLS_SCHEDULE` | `false` |
+| `schedule.cron` | `PG_TOOLS_SCHEDULE_CRON` | `0 3 * * *` |
+| `schedule.timezone` | `PG_TOOLS_SCHEDULE_TIMEZONE` | *(app scheduler timezone)* |
+| `schedule.keep` | `PG_TOOLS_SCHEDULE_KEEP` | *(falls back to `keep`)* |
+| `schedule.upload` | `PG_TOOLS_SCHEDULE_UPLOAD` | `false` |
+| `schedule.check` | `PG_TOOLS_SCHEDULE_CHECK` | `true` |
+| `schedule.check_cron` | `PG_TOOLS_SCHEDULE_CHECK_CRON` | `0 4 * * *` |
 | `binaries.pg_dump` | `PG_TOOLS_PG_DUMP` | `pg_dump` |
 | `binaries.pg_restore` | `PG_TOOLS_PG_RESTORE` | `pg_restore` |
 | `binaries.psql` | `PG_TOOLS_PSQL` | `psql` |
@@ -322,11 +455,31 @@ they drift.
 
 ## Scheduling
 
+The package can register its own schedule. It is off by default — a package that starts dumping
+your database on a timer the moment it is installed is a surprise, not a convenience:
+
+```bash
+PG_TOOLS_SCHEDULE=true
+PG_TOOLS_SCHEDULE_CRON="0 3 * * *"
+PG_TOOLS_SCHEDULE_UPLOAD=true
+```
+
+That registers `pg:backup --force --keep=<keep>` at the given cron, `withoutOverlapping(60)` and
+`onOneServer` — a dump slower than its interval must not start a second one on top of the first,
+because two `pg_dump`s against one server is how a backup window becomes an outage. It also
+schedules `pg:check --quiet-ok` an hour later, so a scheduler that quietly stopped producing
+dumps raises `BackupStale` rather than nothing at all. Set `PG_TOOLS_SCHEDULE_CHECK=false` to
+skip that half.
+
+Prefer to wire it yourself:
+
 ```php
 // app/Console/Kernel.php (Laravel 10) or routes/console.php (11+)
-$schedule->command('pg:backup --force --keep=7')
+$schedule->command('pg:backup --force --keep=7 --upload --keep-remote')
     ->dailyAt('03:00')
     ->withoutOverlapping(60);
+
+$schedule->command('pg:check --quiet-ok')->dailyAt('04:00');
 ```
 
 The scheduler must run on a host or image that has the client binaries. If your scheduler runs
@@ -360,8 +513,10 @@ composer test
 ```
 
 The suite covers connection-override precedence, argv construction, version verdicts, manifest
-round-tripping, checksum detection and table-pattern matching. It touches no database and needs
-no `pg_dump`, so it runs anywhere. CI exercises PHP 8.1–8.4 against Laravel 10, 11 and 12.
+round-tripping, checksum detection, table-pattern matching, the offsite disk (against
+`Storage::fake`), staleness detection and schedule registration. It touches no database, needs
+no `pg_dump` and no bucket, so it runs anywhere. CI exercises PHP 8.1–8.4 against Laravel 10, 11
+and 12.
 
 ## Changelog
 

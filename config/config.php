@@ -47,6 +47,67 @@ return [
     /* Dumps to retain when --keep is passed without a value. 0 keeps everything. */
     'keep' => (int) $value('PG_TOOLS_KEEP', 7),
 
+    /*
+     * Offsite copies. A dump that only exists on the machine that made it is not a backup
+     * of that machine. Name any disk from config/filesystems.php — s3, sftp, ftp, or a
+     * second local disk on another volume. Null keeps everything local, as before.
+     */
+    'disk' => $value('PG_TOOLS_DISK'),
+
+    /* Directory within that disk. */
+    'disk_path' => trim((string) $value('PG_TOOLS_DISK_PATH', 'backups'), '/'),
+
+    /* Upload every dump as soon as it is written, without needing --upload. */
+    'upload_after_backup' => filter_var(
+        $value('PG_TOOLS_UPLOAD_AFTER_BACKUP', false),
+        FILTER_VALIDATE_BOOLEAN
+    ),
+
+    /*
+     * Dumps to retain on the disk. Kept separate from `keep` because the two answer
+     * different questions: local retention is bounded by the volume, offsite retention by
+     * how far back you want to be able to go.
+     */
+    'keep_remote' => (int) $value('PG_TOOLS_KEEP_REMOTE', 30),
+
+    /*
+     * Hours after which the newest verified backup is considered stale. pg:check fails
+     * past this, so it is both a scheduler canary and a container healthcheck.
+     */
+    'max_age_hours' => (int) $value('PG_TOOLS_MAX_AGE_HOURS', 26),
+
+    /*
+     * Built-in schedule. Off by default: a package that silently starts dumping your
+     * database on a timer is a surprise, not a feature. Turn it on and the provider
+     * registers the entries below with the application's scheduler, withoutOverlapping
+     * and onOneServer, so a slow dump can never stack up behind itself.
+     *
+     * The scheduler must run somewhere the client binaries are installed. If artisan runs
+     * in one container and the scheduler in another, both need them.
+     */
+    'schedule' => [
+        'enabled' => filter_var($value('PG_TOOLS_SCHEDULE', false), FILTER_VALIDATE_BOOLEAN),
+
+        /* Standard cron expression. Default: 03:00 daily. */
+        'cron' => (string) $value('PG_TOOLS_SCHEDULE_CRON', '0 3 * * *'),
+
+        /* Null uses the application's scheduler timezone. */
+        'timezone' => $value('PG_TOOLS_SCHEDULE_TIMEZONE'),
+
+        /* Retention applied by the scheduled run. Null falls back to `keep`. */
+        'keep' => ($keep = $value('PG_TOOLS_SCHEDULE_KEEP')) === null ? null : (int) $keep,
+
+        /* Upload each scheduled dump to the configured disk. */
+        'upload' => filter_var($value('PG_TOOLS_SCHEDULE_UPLOAD', false), FILTER_VALIDATE_BOOLEAN),
+
+        /*
+         * Also schedule pg:check, an hour after the backup, so a scheduler that quietly
+         * stopped producing dumps raises a BackupStale event instead of nothing at all.
+         */
+        'check'      => filter_var($value('PG_TOOLS_SCHEDULE_CHECK', true), FILTER_VALIDATE_BOOLEAN),
+        'check_cron' => (string) $value('PG_TOOLS_SCHEDULE_CHECK_CRON', '0 4 * * *'),
+    ],
+
     /* Absolute paths, or bare names to be resolved against PATH. */
     'binaries' => [
         'pg_dump'    => $value('PG_TOOLS_PG_DUMP', 'pg_dump'),

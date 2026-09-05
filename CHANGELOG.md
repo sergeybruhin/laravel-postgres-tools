@@ -12,6 +12,51 @@ change in a minor release.
 
 - Packagist submission, after which version and download badges are added to the README.
 
+## [0.2.0] - 2026-09-05
+
+Offsite copies, events, a staleness check, and a schedule.
+
+### Added
+
+- **Offsite storage on any Laravel disk.** `PG_TOOLS_DISK` names a disk from
+  `config/filesystems.php` — s3, sftp, ftp, or a second local disk — and `pg:backup --upload`
+  copies the dump and its manifest there. `pg:backups --remote` lists it, `pg:verify --remote`
+  hashes an object in place without downloading it, and `pg:restore --from-disk` fetches a dump
+  before restoring it — staged in a dotted directory inside the backup directory, never on top
+  of it, since a dump fetched from a disk usually carries the same filename as the local copy it
+  was made from. Separate `keep_remote` retention, because a local volume and an archive bucket
+  are sized for different questions. Everything streams, so a dump larger than
+  `memory_limit` is not a problem. Uploads are size-checked and a short one is deleted rather
+  than left looking like a backup; the manifest is uploaded last and doubles as the
+  completion marker that object stores cannot express with an atomic rename.
+- **Events**, so the host application decides what a backup outcome means:
+  `BackupStarted`, `BackupCompleted`, `BackupFailed`, `BackupUploaded`, `BackupUploadFailed`,
+  `BackupPruned`, `BackupStale`, `RestoreStarted`, `RestoreCompleted`, `RestoreFailed`.
+  `BackupCompleted` carries the manifest; `RestoreCompleted` carries the reconciliation result
+  and an `isClean()` helper, because a restore that lands with rows missing still exits zero.
+  `BackupFailed` also fires when a run is refused before it begins — a scheduled backup whose
+  `pg_dump` vanished would otherwise emit nothing, and silence is indistinguishable from a
+  scheduler that stopped running.
+- **`pg:check`** — exits non-zero unless a recent, verifiable dump exists: present, manifested,
+  within `max_age_hours`, size matching, and with `--checksum` byte-identical. Works against
+  `--remote` too, touches no database, and has `--quiet-ok` for cron and container healthchecks.
+  Fires `BackupStale`. This is the command that catches the failure `pg:backup` cannot report,
+  because nothing ran.
+- **Built-in schedule**, opt-in via `PG_TOOLS_SCHEDULE=true`: registers `pg:backup` at
+  `schedule.cron` with `withoutOverlapping(60)` and `onOneServer`, plus `pg:check` an hour later.
+  Off by default.
+
+### Fixed
+
+- An option given as `0` was read as "unset" and fell back to the configured value, so
+  `--keep=0` did not disable rotation and `--max-age=0` behaved like the most lenient setting
+  rather than the strictest.
+
+### Requirements
+
+- Adds `illuminate/filesystem` and `illuminate/contracts`, both already present in any Laravel
+  application. PHP, Laravel and PostgreSQL requirements are unchanged.
+
 ## [0.1.0] - 2026-08-30
 
 Initial release.
@@ -53,5 +98,6 @@ Initial release.
 - PHP 8.1+, Laravel 10/11/12, PostgreSQL 14+. Servers below 14 are refused rather than
   quietly attempted.
 
-[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sergeybruhin/laravel-postgres-tools/releases/tag/v0.1.0

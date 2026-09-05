@@ -3,6 +3,10 @@
 namespace SergeyBruhin\PostgresTools\Console;
 
 use Illuminate\Console\Command;
+use Illuminate\Contracts\Events\Dispatcher;
+use SergeyBruhin\PostgresTools\Events\RestoreCompleted;
+use SergeyBruhin\PostgresTools\Events\RestoreFailed;
+use SergeyBruhin\PostgresTools\Events\RestoreStarted;
 use SergeyBruhin\PostgresTools\Data\BackupFile;
 use SergeyBruhin\PostgresTools\Data\DumpOptions;
 use SergeyBruhin\PostgresTools\Data\Finding;
@@ -13,8 +17,10 @@ use SergeyBruhin\PostgresTools\Services\BackupRepository;
 use SergeyBruhin\PostgresTools\Services\ConsistencyChecker;
 use SergeyBruhin\PostgresTools\Services\EnvironmentReport;
 use SergeyBruhin\PostgresTools\Services\ManifestWriter;
+use SergeyBruhin\PostgresTools\Services\RemoteRepository;
 use SergeyBruhin\PostgresTools\Services\RestoreService;
 use SergeyBruhin\PostgresTools\Services\TargetResolver;
+use Throwable;
 
 class RestoreCommand extends Command
 {
@@ -23,6 +29,10 @@ class RestoreCommand extends Command
         {--connection= : Laravel connection to restore into}
         {--database=   : Override the database name within that connection}
         {--path=       : Backup directory to look in (default: config postgres-tools.path)}
+        {--from-disk   : Fetch the dump from the offsite disk first (file defaults to the newest there)}
+        {--disk=       : Disk to fetch from (implies --from-disk; default: config postgres-tools.disk)}
+        {--disk-path=  : Directory within that disk (default: config postgres-tools.disk_path)}
+        {--keep-download : Keep the downloaded copy in the backup directory afterwards}
         {--drop        : DROP and CREATE the target database before restoring}
         {--clean       : pg_restore --clean --if-exists instead of dropping the database}
         {--jobs=1      : Parallel restore workers (custom format only)}
@@ -33,6 +43,12 @@ class RestoreCommand extends Command
 
     protected $description = 'Restore a Postgres dump, verifying it first and reconciling row counts afterwards';
 
+    /** Staging directory for dumps pulled off a disk, inside the backup directory. */
+    private const INCOMING = '.incoming';
+
+    /** Set when the dump was fetched from a disk, so it can be cleaned up afterwards. */
+    private ?string $downloaded = null;
+
     public function handle(
         TargetResolver     $resolver,
         EnvironmentReport  $report,
@@ -40,6 +56,8 @@ class RestoreCommand extends Command
         RestoreService     $restores,
         ManifestWriter     $manifests,
         ConsistencyChecker $checker,
+        RemoteRepository   $remote,
+        Dispatcher         $events,
     ): int {
         if (($guard = $this->guardEnvironment()) !== null) {
             return $guard;
@@ -48,7 +66,9 @@ class RestoreCommand extends Command
         try {
             $target = $resolver->resolve($this->option('connection'), $this->option('database'));
             $path   = $backups->path($this->option('path'));
-            $file   = $this->resolveFile($backups, $path);
+            $file   = $this->fromDisk()
+                ? $this->fetch($remote, $backups, $path)
+                : $this->resolveFile($backups, $path);
         } catch (PostgresToolsException $e) {
             $this->error($e->getMessage());
 
@@ -78,6 +98,13 @@ class RestoreCommand extends Command
         $this->summary($target, $file, $manifest, $server, $exists);
 
         if ($this->printFindings($findings) === self::FAILURE) {
+            $events->dispatch(new RestoreFailed(
+                $target,
+                $file,
+                new PostgresToolsException('Refused before restoring; see the findings above.'),
+                0.0
+            ));
+
             return self::FAILURE;
         }
 
@@ -97,6 +124,9 @@ class RestoreCommand extends Command
             return self::SUCCESS;
         }
 
+        $events->dispatch(new RestoreStarted($target, $file, $manifest));
+        $started = microtime(true);
+
         try {
             if ($this->option('drop')) {
                 $this->line("Recreating database {$target->database}…");
@@ -105,9 +135,8 @@ class RestoreCommand extends Command
                 $this->line("Created database {$target->database}.");
             }
 
-            $plain   = $this->formatOf($file, $manifest) === DumpOptions::FORMAT_PLAIN;
-            $started = microtime(true);
-            $echo    = function (string $line): void {
+            $plain = $this->formatOf($file, $manifest) === DumpOptions::FORMAT_PLAIN;
+            $echo  = function (string $line): void {
                 $this->line('  ' . $line);
             };
 
@@ -127,17 +156,137 @@ class RestoreCommand extends Command
 
             $elapsed = round(microtime(true) - $started, 1);
             $this->info("Restored in {$elapsed}s." . ($warnings === [] ? '' : ' ' . count($warnings) . ' warning(s).'));
-        } catch (PostgresToolsException $e) {
+        } catch (Throwable $e) {
+            // A restore that stops half-way leaves the target in an unusable state, so this
+            // event matters more than its backup counterpart: something is down, not stale.
+            $events->dispatch(new RestoreFailed($target, $file, $e, round(microtime(true) - $started, 1)));
+
+            if (!$e instanceof PostgresToolsException) {
+                throw $e;
+            }
+
             $this->error($e->getMessage());
 
             return self::FAILURE;
         }
 
-        if (!$this->option('skip-checks')) {
-            $this->reconcile($checker, $target, $manifest);
-        }
+        ['differences' => $differences, 'pending' => $pending] = $this->option('skip-checks')
+            ? ['differences' => [], 'pending' => []]
+            : $this->reconcile($checker, $target, $manifest);
+
+        $events->dispatch(new RestoreCompleted(
+            target:              $target,
+            file:                $file,
+            seconds:             round(microtime(true) - $started, 1),
+            manifest:            $manifest,
+            warnings:            $warnings,
+            rowCountDifferences: $differences,
+            pendingMigrations:   $pending,
+        ));
+
+        $this->discardDownload($backups, $file);
 
         return self::SUCCESS;
+    }
+
+    private function fromDisk(): bool
+    {
+        return (bool) $this->option('from-disk') || $this->option('disk') !== null;
+    }
+
+    /**
+     * Pull the dump local before doing anything else. Everything downstream — checksum,
+     * archive parse, pg_restore itself — needs a real file, so the download is not an
+     * alternative path through the command, just a step in front of the existing one.
+     *
+     * @throws PostgresToolsException
+     */
+    private function fetch(RemoteRepository $remote, BackupRepository $backups, string $path): string
+    {
+        $disk      = $this->option('disk');
+        $directory = $this->option('disk-path');
+
+        $name = $this->argument('file')
+            ?? ($remote->latest($disk, $directory)?->name()
+                ?? throw new PostgresToolsException(
+                    'No dumps on disk [' . $remote->diskName($disk) . '] under ' . $remote->directory($directory) . '/.'
+                ));
+
+        // Never straight into the backup directory: a dump fetched from the disk usually
+        // has the same filename as the local copy it was made from, and landing on top of
+        // it would overwrite a real backup with a temporary one — which the cleanup below
+        // would then delete. The staging directory is dotted, so listings skip it.
+        $incoming = $path . '/' . self::INCOMING;
+        $backups->ensureDirectory($incoming);
+
+        // A restore that fails part-way leaves its download staged on purpose: retrying
+        // should not pay to pull a multi-gigabyte dump down a second time. That means the
+        // staging area is cleared on the way in rather than on the way out, so at most one
+        // abandoned dump is ever holding space.
+        foreach (glob($incoming . '/*') ?: [] as $leftover) {
+            is_file($leftover) && @unlink($leftover);
+        }
+
+        $file = $remote->download((string) $name, $incoming, $disk, $directory, function (string $line): void {
+            $this->line($line);
+        });
+
+        $this->downloaded = $file;
+        $this->info('Fetched ' . basename($file) . ' from ' . $remote->diskName($disk) . '.');
+
+        return $file;
+    }
+
+    /**
+     * A dump pulled from the disk is a working copy, not a backup: leaving it behind grows
+     * the local directory outside whatever retention pg:backup applies, and on a restore
+     * host that is often the smallest volume around. --keep-download opts out.
+     */
+    private function discardDownload(BackupRepository $backups, string $file): void
+    {
+        if ($this->downloaded === null) {
+            return;
+        }
+
+        $incoming = dirname($file);
+
+        if ($this->option('keep-download')) {
+            $this->keepDownload($backups, $file, $incoming);
+
+            return;
+        }
+
+        @unlink(BackupFile::manifestPathFor($file));
+
+        if (@unlink($file)) {
+            $this->line('Removed the downloaded copy. Pass --keep-download to keep it next time.');
+        }
+
+        @rmdir($incoming);
+    }
+
+    /**
+     * Promote the staged copy into the backup directory, unless something is already
+     * sitting under that name — in which case the existing dump wins and the staged one
+     * is left where it is, named in full, rather than quietly replacing a real backup.
+     */
+    private function keepDownload(BackupRepository $backups, string $file, string $incoming): void
+    {
+        $destination = $backups->path($this->option('path')) . '/' . basename($file);
+
+        if (file_exists($destination)) {
+            $this->warn('Kept the downloaded copy at ' . $file . '.');
+            $this->line('  ' . $destination . ' already exists and was left untouched.');
+
+            return;
+        }
+
+        @rename(BackupFile::manifestPathFor($file), BackupFile::manifestPathFor($destination));
+
+        if (@rename($file, $destination)) {
+            $this->line('Kept the downloaded copy at ' . $destination . '.');
+            @rmdir($incoming);
+        }
     }
 
     /**
@@ -306,9 +455,13 @@ class RestoreCommand extends Command
         return $this->confirm("Restore into {$target->describe()}?", false);
     }
 
-    private function reconcile(ConsistencyChecker $checker, Target $target, ?Manifest $manifest): void
+    /**
+     * @return array{differences: array<int, array<int, mixed>>, pending: array<string>}
+     */
+    private function reconcile(ConsistencyChecker $checker, Target $target, ?Manifest $manifest): array
     {
         $this->newLine();
+        $diff = [];
 
         if ($manifest === null) {
             $this->line('No manifest — skipping row-count reconciliation.');
@@ -329,7 +482,7 @@ class RestoreCommand extends Command
         if ($pending === []) {
             $this->info('Schema is up to date with database/migrations.');
 
-            return;
+            return ['differences' => $diff, 'pending' => []];
         }
 
         $this->warn(count($pending) . ' pending migration(s) — run `php artisan migrate`:');
@@ -341,6 +494,8 @@ class RestoreCommand extends Command
         if (count($pending) > 10) {
             $this->line('  … and ' . (count($pending) - 10) . ' more');
         }
+
+        return ['differences' => $diff, 'pending' => $pending];
     }
 
     /** @param array<Finding> $findings */
