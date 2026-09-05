@@ -1,5 +1,7 @@
 * text=auto eol=lf
 
+# Keep the installable package to what an application actually runs. CONTRIBUTING.md and
+# SECURITY.md stay in: the README links to them, and they cost a few kilobytes.
 /.github        export-ignore
 /tests          export-ignore
 /.editorconfig  export-ignore

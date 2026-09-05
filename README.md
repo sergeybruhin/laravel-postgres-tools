@@ -1,7 +1,10 @@
 # Laravel PostgreSQL Tools
 
-[![tests](https://github.com/sergeybruhin/laravel-postgres-tools/actions/workflows/tests.yml/badge.svg)](https://github.com/sergeybruhin/laravel-postgres-tools/actions/workflows/tests.yml)
-[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
+[![Latest version on Packagist](https://img.shields.io/packagist/v/sergeybruhin/laravel-postgres-tools.svg)](https://packagist.org/packages/sergeybruhin/laravel-postgres-tools)
+[![Tests](https://github.com/sergeybruhin/laravel-postgres-tools/actions/workflows/tests.yml/badge.svg)](https://github.com/sergeybruhin/laravel-postgres-tools/actions/workflows/tests.yml)
+[![PHP version](https://img.shields.io/packagist/dependency-v/sergeybruhin/laravel-postgres-tools/php.svg)](https://packagist.org/packages/sergeybruhin/laravel-postgres-tools)
+[![Total downloads](https://img.shields.io/packagist/dt/sergeybruhin/laravel-postgres-tools.svg)](https://packagist.org/packages/sergeybruhin/laravel-postgres-tools)
+[![License](https://img.shields.io/packagist/l/sergeybruhin/laravel-postgres-tools.svg)](LICENSE.md)
 
 PostgreSQL backup and restore as Artisan commands, with the checks that turn *"the command
 exited 0"* into *"this dump is actually restorable"*.
@@ -520,7 +523,24 @@ and 12.
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md).
+See [CHANGELOG.md](CHANGELOG.md) for what changed in each release. This package follows
+[semantic versioning](https://semver.org); while the version is below 1.0.0, config keys,
+event payloads and command options may change in a minor release.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Security
+
+This package's whole subject matter is files that contain an entire database. If you find a
+vulnerability, please report it as described in [SECURITY.md](SECURITY.md) rather than opening
+a public issue.
+
+## Credits
+
+- [Sergey Bruhin](https://github.com/sergeybruhin)
+- [All contributors](https://github.com/sergeybruhin/laravel-postgres-tools/contributors)
 
 ## License
 

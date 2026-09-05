@@ -55,12 +55,13 @@
         "sort-packages": true
     },
     "extra": {
+        "branch-alias": {
+            "dev-master": "0.2.x-dev"
+        },
         "laravel": {
             "providers": [
                 "SergeyBruhin\\PostgresTools\\Providers\\PostgresToolsServiceProvider"
             ]
         }
-    },
-    "minimum-stability": "stable",
-    "prefer-stable": true
+    }
 }
