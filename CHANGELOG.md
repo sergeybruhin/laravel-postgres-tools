@@ -12,6 +12,19 @@ change in a minor release.
 
 - Packagist submission, after which version and download badges are added to the README.
 
+## [0.3.1] - 2026-09-06
+
+### Security
+
+- Added `BackupRepository::resolveInDirectory()`, which resolves a filename strictly inside
+  the backup directory — never the process's working directory, never an absolute path, never
+  able to escape via `..` or a symlink. `resolveFile()`'s working-directory fallback is
+  intentional for a trusted CLI operator typing a path they already know exists, but it is not
+  safe to reach with a filename taken from an HTTP request: a bare name like `.env` resolves
+  against the app root under php-fpm and hands back the application's real `.env` instead of
+  "not found". `nova-postgres-tools` ^0.2.1 uses the new method for every endpoint that takes a
+  filename from the request; `pg:backup`/`pg:restore`/`pg:verify` are unaffected.
+
 ## [0.3.0] - 2026-09-06
 
 ### Added
@@ -108,7 +121,8 @@ Initial release.
 - PHP 8.1+, Laravel 10/11/12, PostgreSQL 14+. Servers below 14 are refused rather than
   quietly attempted.
 
-[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sergeybruhin/laravel-postgres-tools/releases/tag/v0.1.0

@@ -74,6 +74,13 @@ final class BackupRepository
      * Resolve a user-supplied path, which may be absolute, relative to the working
      * directory, or a bare filename inside the backup directory.
      *
+     * This is for a trusted CLI operator typing a path they already know exists — someone
+     * with shell access has arbitrary file read regardless. It must never be called with a
+     * filename that came from an HTTP request: the working-directory fallback would resolve
+     * a bare name like ".env" against the process's cwd (the application root under
+     * php-fpm) and hand back the application's own secrets instead of a "file not found".
+     * Untrusted input goes through resolveInDirectory() instead.
+     *
      * @throws PostgresToolsException
      */
     public function resolveFile(string $file, string $path): string
@@ -87,6 +94,36 @@ final class BackupRepository
         throw new PostgresToolsException(
             "Dump not found: {$file}" . PHP_EOL . "Looked in the working directory and in {$path}."
         );
+    }
+
+    /**
+     * Resolve a filename strictly inside $path — never the working directory, never an
+     * absolute path, never able to escape via `..` or a symlink pointing elsewhere. This is
+     * what anything driven by untrusted input (an HTTP request's query string or JSON body)
+     * must call: the caller only ever has legitimate reason to name a file that pg:backups
+     * already listed, so there is nothing lost by refusing everything else.
+     *
+     * @throws PostgresToolsException
+     */
+    public function resolveInDirectory(string $name, string $path): string
+    {
+        $candidate = $path . '/' . basename($name);
+        $notFound  = new PostgresToolsException(
+            'Dump not found: ' . basename($name) . PHP_EOL . "Looked in {$path}."
+        );
+
+        if (!is_file($candidate)) {
+            throw $notFound;
+        }
+
+        $real     = realpath($candidate);
+        $realPath = realpath($path);
+
+        if ($real === false || $realPath === false || !str_starts_with($real, $realPath . DIRECTORY_SEPARATOR)) {
+            throw $notFound;
+        }
+
+        return $real;
     }
 
     /**
