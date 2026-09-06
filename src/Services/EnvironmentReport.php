@@ -205,6 +205,12 @@ final class EnvironmentReport
     /**
      * Everything a command needs to decide whether to proceed.
      *
+     * $binaryVersions overrides the local probe with versions discovered elsewhere — the
+     * queue worker that actually runs pg_dump, say, when this is called from a web request
+     * that itself has no client binaries and never will. Null probes locally, which is
+     * always correct for pg:info/pg:backup/pg:restore since they run where the dump does.
+     *
+     * @param array<string, ?string>|null $binaryVersions
      * @return array<Finding>
      */
     public function findings(
@@ -212,6 +218,7 @@ final class EnvironmentReport
         string $path,
         bool   $requireBinaries = true,
         bool   $requireDatabase = true,
+        ?array $binaryVersions = null,
     ): array {
         $findings = [];
         $server   = $this->server($target);
@@ -239,8 +246,10 @@ final class EnvironmentReport
         }
 
         if ($requireBinaries) {
+            $binaries = $binaryVersions ?? $this->binaryVersions();
+
             foreach (['pg_dump', 'pg_restore'] as $binary) {
-                if (!$this->binaries->has($binary)) {
+                if (($binaries[$binary] ?? null) === null) {
                     $package = $this->recommendedClientPackage($server['major']);
 
                     $findings[] = Finding::fail(
@@ -251,7 +260,7 @@ final class EnvironmentReport
             }
 
             $findings[] = $this->compatibility(
-                BinaryLocator::major($this->binaries->probe('pg_dump')),
+                BinaryLocator::major($binaries['pg_dump'] ?? null),
                 $server['major'],
             );
         }

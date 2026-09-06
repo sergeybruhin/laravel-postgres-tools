@@ -12,6 +12,16 @@ change in a minor release.
 
 - Packagist submission, after which version and download badges are added to the README.
 
+## [0.3.0] - 2026-09-06
+
+### Added
+
+- `EnvironmentReport::findings()` takes an optional `$binaryVersions` override, so a caller that
+  probed `pg_dump`/`pg_restore` somewhere other than its own process — a queue worker, checked
+  from the web request that renders a status page — can report against those versions instead of
+  the local (and possibly binary-less) ones. `pg:info`/`pg:backup`/`pg:restore` are unaffected;
+  they still probe locally, which is always correct for a process that is about to shell out.
+
 ## [0.2.0] - 2026-09-05
 
 Offsite copies, events, a staleness check, and a schedule.
@@ -98,6 +108,7 @@ Initial release.
 - PHP 8.1+, Laravel 10/11/12, PostgreSQL 14+. Servers below 14 are refused rather than
   quietly attempted.
 
-[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sergeybruhin/laravel-postgres-tools/releases/tag/v0.1.0
