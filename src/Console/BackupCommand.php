@@ -4,6 +4,7 @@ namespace SergeyBruhin\PostgresTools\Console;
 
 use Illuminate\Console\Command;
 use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Support\Str;
 use SergeyBruhin\PostgresTools\Events\BackupCompleted;
 use SergeyBruhin\PostgresTools\Events\BackupFailed;
 use SergeyBruhin\PostgresTools\Events\BackupPruned;
@@ -207,7 +208,26 @@ class BackupCommand extends Command
 
     private function defaultName(Target $target, DumpOptions $options): string
     {
-        return sprintf('%s-%s.%s', $target->database, now()->format('Y-m-d_His'), $options->extension());
+        return sprintf(
+            '%s-%s-%s.%s',
+            $this->siteSlug(),
+            $target->database,
+            now()->format('Y-m-d_His'),
+            $options->extension()
+        );
+    }
+
+    /**
+     * The site's own name, not the database's — "homestead" or "forge" says nothing about
+     * which of several sites a dump found loose on a laptop or a shared bucket came from.
+     * Slugged to lowercase ASCII so an APP_NAME with spaces, punctuation or non-Latin script
+     * still produces a filename every shell and filesystem handles without quoting.
+     */
+    private function siteSlug(): string
+    {
+        $slug = Str::slug((string) config('app.name', ''));
+
+        return $slug !== '' ? $slug : 'app';
     }
 
     /** @param array<string, mixed> $server */

@@ -102,7 +102,7 @@ php artisan pg:info --strict || exit 1
 {--connection=          : Laravel connection to read from (default: config default)}
 {--database=            : Override the database name within that connection}
 {--path=                : Output directory (default: config postgres-tools.path)}
-{--name=                : Output filename (default: <db>-<Y-m-d_His>.<ext>)}
+{--name=                : Output filename (default: <site>-<db>-<Y-m-d_His>.<ext>)}
 {--format=              : custom or plain (default: config postgres-tools.format)}
 {--compress=            : Compression level 0-9}
 {--schema-only          : Dump structure without data}

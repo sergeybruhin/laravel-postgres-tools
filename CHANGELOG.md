@@ -12,6 +12,20 @@ change in a minor release.
 
 - Packagist submission, after which version and download badges are added to the README.
 
+## [0.4.0] - 2026-09-06
+
+### Changed
+
+- The default `pg:backup` filename now starts with a lowercase, Latin-only slug of
+  `config('app.name')` — `sergeybruhincom-homestead-2026-09-06_014501.dump` rather than
+  `homestead-2026-09-06_014501.dump`. A raw database name says nothing about which of several
+  sites a dump came from once it is sitting in a shared bucket or a laptop's Downloads folder;
+  the site's own name does. Built with `Str::slug()`, so an `APP_NAME` with spaces, punctuation
+  or non-Latin script still produces a filename every shell and filesystem handles unquoted; a
+  blank or symbols-only name falls back to `app`. Nothing parses the filename structure — the
+  database name shown in Nova and `pg:backups` always comes from the manifest — so this is
+  cosmetic and `--name` still overrides it outright.
+
 ## [0.3.1] - 2026-09-06
 
 ### Security
@@ -121,7 +135,8 @@ Initial release.
 - PHP 8.1+, Laravel 10/11/12, PostgreSQL 14+. Servers below 14 are refused rather than
   quietly attempted.
 
-[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sergeybruhin/laravel-postgres-tools/compare/v0.1.0...v0.2.0
